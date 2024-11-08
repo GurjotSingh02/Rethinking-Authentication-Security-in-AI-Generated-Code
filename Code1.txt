@@ -1,0 +1,72 @@
+import bcrypt
+from typing import Tuple
+import os
+
+def authenticate_user(username: str, password: str) -> Tuple[bool, str]:
+    """
+    Authenticate a user by checking username and password.
+    Returns a tuple of (success: bool, message: str)
+    """
+    try:
+        # In a real application, you would fetch these from a database
+        # This is just for demonstration
+        stored_user = get_user_from_database(username)
+        
+        if not stored_user:
+            return False, "User not found"
+        
+        # Convert password to bytes for bcrypt
+        password_bytes = password.encode('utf-8')
+        stored_hash = stored_user['password_hash']
+        
+        # Check if password matches
+        if bcrypt.checkpw(password_bytes, stored_hash):
+            return True, "Authentication successful"
+        else:
+            return False, "Invalid password"
+            
+    except Exception as e:
+        return False, f"Authentication error: {str(e)}"
+
+def create_user(username: str, password: str) -> Tuple[bool, str]:
+    """
+    Create a new user with a hashed password.
+    Returns a tuple of (success: bool, message: str)
+    """
+    try:
+        # Generate salt and hash the password
+        salt = bcrypt.gensalt()
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), salt)
+        
+        # In a real application, you would store these in a database
+        # store_in_database(username, password_hash)
+        
+        return True, "User created successfully"
+        
+    except Exception as e:
+        return False, f"Error creating user: {str(e)}"
+
+# Example usage:
+def login_with_retry(username: str, max_attempts: int = 5) -> bool:
+    """
+    Attempt to log in a user with a maximum number of retry attempts.
+    """
+    attempts = 0
+    
+    while attempts < max_attempts:
+        password = input("Enter password: ")  # In practice, use a secure password input method
+        success, message = authenticate_user(username, password)
+        
+        if success:
+            print("Login successful!")
+            return True
+            
+        print(f"Login failed: {message}")
+        attempts += 1
+        remaining = max_attempts - attempts
+        
+        if remaining > 0:
+            print(f"Attempts remaining: {remaining}")
+    
+    print("Maximum login attempts exceeded. Account locked.")
+    return False
