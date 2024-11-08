@@ -1,0 +1,182 @@
+import bcrypt
+import jwt
+import hashlib
+import re
+from flask import Flask, request, jsonify, session, make_response
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
+from flask_limiter.util import get_remote_address
+from flask_limiter.decorators import limit
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField
+from wtforms.validators import DataRequired, Length, EqualTo, ValidationError
+from flask_cors import CORS
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SECRET_KEY'] = 'super-secret-key'
+app.config['JWT_SECRET_KEY'] = 'jwt-secret-key'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 3600
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = 86400
+app.config['JWT_COOKIE_SECURE'] = True
+app.config['JWT_COOKIE_HTTPONLY'] = True
+app.config['JWT_COOKIE_SAMESITE'] = 'Lax'
+app.config['JWT_COOKIE_CSRF_PROTECT'] = True
+app.config['JWT_COOKIE_CSRF_CHECK_DEFAULT'] = False
+app.config['JWT_COOKIE_CSRF_CHECK_SCOPE'] = False
+app.config['JWT_COOKIE_REFRESH_TOKEN_ENABLED'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_EXPIRES'] = 86400
+app.config['JWT_COOKIE_REFRESH_TOKEN_PATH'] = '/refresh'
+app.config['JWT_COOKIE_REFRESH_TOKEN_SAME_SITE'] = 'Lax'
+app.config['JWT_COOKIE_REFRESH_TOKEN_SECURE'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_HTTPONLY'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_PROTECT'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_CHECK_DEFAULT'] = False
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_CHECK_SCOPE'] = False
+app.config['JWT_COOKIE_REFRESH_TOKEN_ENABLED'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_EXPIRES'] = 86400
+app.config['JWT_COOKIE_REFRESH_TOKEN_PATH'] = '/refresh'
+app.config['JWT_COOKIE_REFRESH_TOKEN_SAME_SITE'] = 'Lax'
+app.config['JWT_COOKIE_REFRESH_TOKEN_SECURE'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_HTTPONLY'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_PROTECT'] = True
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_CHECK_DEFAULT'] = False
+app.config['JWT_COOKIE_REFRESH_TOKEN_CSRF_CHECK_SCOPE'] = False
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    two_factor_secret = db.Column(db.String(256), nullable=False)
+    last_login_attempt = db.Column(db.DateTime, nullable=True)
+    account_locked = db.Column(db.Boolean, nullable=False, default=False)
+
+def hash_password(password):
+    return bcrypt.generate_password_hash(password).decode('utf-8')
+
+def store_password_in_database(username, password):
+    user = User(username=username, password_hash=hash_password(password))
+    db.session.add(user)
+    db.session.commit()
+
+def validate_username(username):
+    if not username or len(username) > 50:
+        return False
+    return True
+
+def validate_password(password):
+    if not password or not re.search(r'\d', password) or not re.search(r'[A-Z]', password) or not re.search(r'[a-z]', password) or not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False
+    return True
+
+def validate_two_factor_code(username, code):
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.two_factor_secret:
+        return False
+    return user.two_factor_secret == code
+
+def generate_two_factor_secret(username):
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return False
+    user.two_factor_secret = generate_two_factor_secret_code()
+    db.session.commit()
+    return True
+
+def generate_two_factor_secret_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase + string.digits + string.punctuation, k=8))
+
+def authenticate_user(username, password, two_factor_code=None):
+    user = User.query.filter_by(username=username).first()
+    if not user or not bcrypt.checkpw(password.encode(), user.password_hash):
+        return False
+
+    if two_factor_code and not validate_two_factor_code(username, two_factor_code):
+        return False
+
+    if not generate_two_factor_secret(username):
+        return False
+
+    if user.account_locked:
+        user.account_locked = False
+        db.session.commit()
+
+    access_token = create_access_token(identity=username)
+    refresh_token = create_refresh_token(identity=username)
+
+    response = make_response(jsonify({'access_token': access_token, 'refresh_token': refresh_token}))
+    response.set_cookie('access_token', access_token, secure=True, httponly=True, samesite='Lax')
+    response.set_cookie('refresh_token', refresh_token, secure=True, httponly=True, samesite='Lax')
+
+    return response
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
+    two_factor_code = data.get('two_factor_code')
+
+    if not validate_username(username) or not validate_password(password):
+        return jsonify({'error': 'Invalid username or password'}), 400
+
+    if get_remote_address() is None:
+        return jsonify({'error': 'Remote address not available'}), 400
+
+    if get_remote_address() in app.config['LIMITER_IP_WHITELIST']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ENABLE']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_unit']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type_value_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type_value_type_value']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type_value_type_value_type_value_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type']:
+        return authenticate_user(username, password, two_factor_code)
+
+    if not app.config['LIMITER_ACTIONS']['login_attempts_per_ip_interval_max_count_unit_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value_type_value
