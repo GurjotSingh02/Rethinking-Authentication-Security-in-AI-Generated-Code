@@ -1,0 +1,86 @@
+import bcrypt
+import jwt
+import hashlib
+import re
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SECRET_KEY'] = 'super-secret-key'
+app.config['JWT_SECRET_KEY'] = 'jwt-secret-key'
+db = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    two_factor_secret = db.Column(db.String(256), nullable=False)
+
+def hash_password(password):
+    return bcrypt.generate_password_hash(password).decode('utf-8')
+
+def store_password_in_database(username, password):
+    user = User(username=username, password_hash=hash_password(password))
+    db.session.add(user)
+    db.session.commit()
+
+def validate_username(username):
+    if not username or len(username) > 50:
+        return False
+    return True
+
+def validate_password(password):
+    if not password or not re.search(r'\d', password) or not re.search(r'[A-Z]', password) or not re.search(r'[a-z]', password) or not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False
+    return True
+
+def validate_two_factor_code(username, code):
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.two_factor_secret:
+        return False
+    return user.two_factor_secret == code
+
+def generate_two_factor_secret(username):
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return False
+    user.two_factor_secret = generate_two_factor_secret_code()
+    db.session.commit()
+    return True
+
+def generate_two_factor_secret_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase + string.digits + string.punctuation, k=8))
+
+def authenticate_user(username, password, two_factor_code=None):
+    user = User.query.filter_by(username=username).first()
+    if not user or not bcrypt.checkpw(password.encode(), user.password_hash):
+        return False
+
+    if two_factor_code and not validate_two_factor_code(username, two_factor_code):
+        return False
+
+    if not generate_two_factor_secret(username):
+        return False
+
+    access_token = create_access_token(identity=username)
+    return {'access_token': access_token}
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
+    two_factor_code = data.get('two_factor_code')
+
+    if not validate_username(username) or not validate_password(password):
+        return jsonify({'error': 'Invalid username or password'}), 400
+
+    return authenticate_user(username, password, two_factor_code)
+
+if __name__ == '__main__':
+    app.run(debug=True)
