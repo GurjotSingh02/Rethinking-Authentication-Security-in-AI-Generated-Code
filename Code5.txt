@@ -1,0 +1,468 @@
+from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import bcrypt
+import pyotp
+import jwt
+from datetime import datetime, timedelta
+import secrets
+from typing import Optional, Dict, Tuple
+import logging
+import re
+from dataclasses import dataclass
+import os
+from cryptography.fernet import Fernet
+from email_validator import validate_email, EmailNotValidError
+import html
+from http import HTTPStatus
+
+# Configure logging with secure settings
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('security.log'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(String(36), primary_key=True)
+    username = Column(String(64), unique=True, nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    mfa_secret = Column(String(32), nullable=True)
+    mfa_enabled = Column(Boolean, default=False)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    last_login = Column(DateTime, nullable=True)
+    password_changed_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    password_history = Column(String(1024), nullable=True)  # Store last 5 password hashes
+    recovery_codes = Column(String(512), nullable=True)
+    last_token_rotation = Column(DateTime, nullable=True)
+
+class Session(Base):
+    __tablename__ = 'sessions'
+    
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    token_hash = Column(String(255), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+    last_activity = Column(DateTime, nullable=True)
+
+class AuthenticationError(Exception):
+    """Custom exception for authentication errors"""
+    def __init__(self, message: str, status_code: int = HTTPStatus.UNAUTHORIZED):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
+class SecurityConfig:
+    """Security configuration following NIST guidelines"""
+    MIN_PASSWORD_LENGTH = 8
+    MAX_PASSWORD_LENGTH = 64
+    MAX_LOGIN_ATTEMPTS = 5
+    LOCKOUT_DURATION = timedelta(minutes=30)
+    PASSWORD_EXPIRY = timedelta(days=90)
+    SESSION_DURATION = timedelta(hours=12)
+    TOKEN_ROTATION_INTERVAL = timedelta(hours=1)
+    MFA_TIMEOUT = timedelta(minutes=5)
+    BCRYPT_ROUNDS = 12  # Adjust based on server capability
+    PASSWORD_HISTORY_SIZE = 5
+
+class SecurityManager:
+    def __init__(self):
+        # Initialize with secure defaults
+        self.config = SecurityConfig()
+        self._initialize_crypto()
+        self._setup_database()
+
+    def _initialize_crypto(self):
+        """Initialize cryptographic components"""
+        self.jwt_secret = os.getenv('JWT_SECRET_KEY')
+        if not self.jwt_secret:
+            raise ValueError("JWT secret key not configured")
+            
+        self.fernet_key = os.getenv('FERNET_KEY')
+        if not self.fernet_key:
+            self.fernet_key = Fernet.generate_key()
+            logger.warning("Fernet key not found, generated new key")
+            
+        self.fernet = Fernet(self.fernet_key)
+
+    def _setup_database(self):
+        """Initialize database with secure connection"""
+        db_url = os.getenv('DATABASE_URL')
+        if not db_url:
+            raise ValueError("Database URL not configured")
+            
+        self.engine = create_engine(db_url, pool_pre_ping=True)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+
+    def _sanitize_input(self, input_str: str) -> str:
+        """Sanitize input to prevent injection attacks"""
+        if not isinstance(input_str, str):
+            raise ValueError("Input must be a string")
+            
+        # HTML escape
+        sanitized = html.escape(input_str)
+        
+        # Remove potential SQL injection patterns
+        dangerous_patterns = [
+            r'--', r';', r'\/\*', r'\*\/', r'@@', r'@',
+            r'char\s*\(', r'exec\s*\(', r'eval\s*\('
+        ]
+        for pattern in dangerous_patterns:
+            sanitized = re.sub(pattern, '', sanitized, flags=re.IGNORECASE)
+            
+        return sanitized.strip()
+
+    def validate_password(self, password: str) -> Tuple[bool, str]:
+        """Validate password against NIST guidelines"""
+        try:
+            if not isinstance(password, str):
+                return False, "Invalid password format"
+
+            if (len(password) < self.config.MIN_PASSWORD_LENGTH or 
+                len(password) > self.config.MAX_PASSWORD_LENGTH):
+                return False, f"Password must be between {self.config.MIN_PASSWORD_LENGTH} and {self.config.MAX_PASSWORD_LENGTH} characters"
+
+            # Check against common passwords (implement with proper dictionary)
+            common_passwords = self._load_common_passwords()
+            if password.lower() in common_passwords:
+                return False, "Password is too common"
+
+            # Check for repeated or sequential characters
+            if re.search(r'(.)\1{2,}', password):
+                return False, "Password contains repeated characters"
+
+            if any(password.lower().count(char) > len(password) * 0.4 
+                  for char in password.lower()):
+                return False, "Password contains too many similar characters"
+
+            return True, "Password meets security requirements"
+
+        except Exception as e:
+            logger.error(f"Password validation error: {str(e)}")
+            raise AuthenticationError("Password validation failed")
+
+    def create_session_token(self, user_id: str, ip_address: str, 
+                           user_agent: str) -> Dict:
+        """Create secure session token with encryption"""
+        try:
+            session_id = secrets.token_urlsafe(32)
+            expires_at = datetime.utcnow() + self.config.SESSION_DURATION
+            
+            # Create token with limited claims
+            token_data = {
+                'session_id': session_id,
+                'user_id': user_id,
+                'exp': expires_at.timestamp()
+            }
+            
+            token = jwt.encode(token_data, self.jwt_secret, algorithm='HS256')
+            
+            # Hash token for storage
+            token_hash = bcrypt.hashpw(token.encode('utf-8'), 
+                                     bcrypt.gensalt(self.config.BCRYPT_ROUNDS))
+            
+            session = Session(
+                id=session_id,
+                user_id=user_id,
+                token_hash=token_hash.decode('utf-8'),
+                expires_at=expires_at,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                last_activity=datetime.utcnow()
+            )
+            
+            db_session = self.Session()
+            try:
+                db_session.add(session)
+                db_session.commit()
+                
+                return {
+                    'token': token,
+                    'expires_at': expires_at.isoformat(),
+                    'session_id': session_id
+                }
+            finally:
+                db_session.close()
+
+        except Exception as e:
+            logger.error(f"Session creation error: {str(e)}")
+            raise AuthenticationError("Failed to create session")
+
+    def authenticate(self, username: str, password: str, mfa_code: Optional[str], 
+                    ip_address: str, user_agent: str) -> Dict:
+        """Main authentication method"""
+        try:
+            # Sanitize inputs
+            username = self._sanitize_input(username)
+            
+            session = self.Session()
+            try:
+                user = session.query(User).filter_by(username=username).first()
+                
+                if not user:
+                    logger.warning(f"Login attempt for non-existent user: {username}")
+                    # Use constant time comparison to prevent timing attacks
+                    bcrypt.checkpw(password.encode('utf-8'), 
+                                 bcrypt.gensalt(self.config.BCRYPT_ROUNDS))
+                    raise AuthenticationError("Invalid credentials")
+
+                # Check account lockout
+                if self._is_account_locked(user):
+                    raise AuthenticationError("Account is temporarily locked")
+
+                # Verify password
+                if not bcrypt.checkpw(password.encode('utf-8'), 
+                                    user.password_hash.encode('utf-8')):
+                    self._handle_failed_attempt(user, session)
+                    raise AuthenticationError("Invalid credentials")
+
+                # Verify MFA if enabled
+                if user.mfa_enabled:
+                    if not mfa_code:
+                        return {'requires_mfa': True, 'temp_token': self._create_temp_token(user.id)}
+                    
+                    if not self._verify_mfa(user, mfa_code):
+                        raise AuthenticationError("Invalid MFA code")
+
+                # Create session
+                
+                # Update user login status
+                user.failed_attempts = 0
+                user.last_login = datetime.utcnow()
+                session.commit()
+                
+                return {
+                    'success': True,
+                    'session': session_data,
+                    'user_id': user.id,
+                    'requires_password_change': self._requires_password_change(user)
+                }
+
+            finally:
+                session.close()
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Authentication error: {str(e)}")
+            raise AuthenticationError("Authentication failed")
+
+    def _verify_mfa(self, user: User, code: str) -> bool:
+        """Verify MFA code"""
+        try:
+            totp = pyotp.TOTP(user.mfa_secret)
+            return totp.verify(code, valid_window=1)
+        except Exception as e:
+            logger.error(f"MFA verification error: {str(e)}")
+            return False
+
+    def validate_session(self, token: str, ip_address: str, 
+                        user_agent: str) -> Dict:
+        """Validate and refresh session token"""
+        try:
+            # Decode token
+            try:
+                payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+            except jwt.ExpiredSignatureError:
+                raise AuthenticationError("Session expired")
+            except jwt.InvalidTokenError:
+                raise AuthenticationError("Invalid session")
+
+            session = self.Session()
+            try:
+                db_session = session.query(Session).filter_by(
+                    id=payload['session_id']
+                ).first()
+
+                if not db_session:
+                    raise AuthenticationError("Session not found")
+
+                # Validate session
+                if datetime.utcnow() > db_session.expires_at:
+                    session.delete(db_session)
+                    session.commit()
+                    raise AuthenticationError("Session expired")
+
+                # Validate IP and user agent for security
+                if db_session.ip_address != ip_address:
+                    logger.warning(f"IP address mismatch for session {db_session.id}")
+                    raise AuthenticationError("Session invalid")
+
+                # Check if token rotation is needed
+                if self._needs_rotation(db_session):
+                    new_session = self.create_session_token(
+                        db_session.user_id, ip_address, user_agent
+                    )
+                    session.delete(db_session)
+                    session.commit()
+                    return new_session
+
+                # Update last activity
+                db_session.last_activity = datetime.utcnow()
+                session.commit()
+
+
+
+            finally:
+                session.close()
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Session validation error: {str(e)}")
+            raise AuthenticationError("Session validation failed")
+
+    def _needs_rotation(self, session: Session) -> bool:
+        """Check if token needs rotation"""
+        if not session.last_token_rotation:
+            return True
+            
+        return datetime.utcnow() - session.last_token_rotation > self.config.TOKEN_ROTATION_INTERVAL
+
+    def logout(self, token: str) -> bool:
+        """Securely terminate session"""
+        try:
+            payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+            session = self.Session()
+            
+            try:
+                db_session = session.query(Session).filter_by(
+                    id=payload['session_id']
+                ).first()
+                
+                if db_session:
+                    session.delete(db_session)
+                    session.commit()
+                    
+                return True
+            finally:
+                session.close()
+                
+        except Exception as e:
+            logger.error(f"Logout error: {str(e)}")
+            return False
+
+    def change_password(self, user_id: str, old_password: str, 
+                       new_password: str) -> bool:
+        """Change password with history check"""
+        try:
+            session = self.Session()
+            try:
+                user = session.query(User).filter_by(id=user_id).first()
+                
+                if not user:
+                    raise AuthenticationError("User not found")
+
+                # Verify old password
+                if not bcrypt.checkpw(old_password.encode('utf-8'), 
+                                    user.password_hash.encode('utf-8')):
+                    raise AuthenticationError("Current password is incorrect")
+
+                # Validate new password
+                valid, message = self.validate_password(new_password)
+                if not valid:
+                    raise AuthenticationError(message)
+
+                # Check password history
+                if self._is_password_reused(user, new_password):
+                    raise AuthenticationError("Password was recently used")
+
+                # Update password
+                new_hash = bcrypt.hashpw(new_password.encode('utf-8'), 
+                                       bcrypt.gensalt(self.config.BCRYPT_ROUNDS))
+                
+                # Update password history
+                self._update_password_history(user, new_hash)
+                
+                user.password_hash = new_hash.decode('utf-8')
+                user.password_changed_at = datetime.utcnow()
+                session.commit()
+                
+                return True
+
+            finally:
+                session.close()
+
+        except AuthenticationError:
+            raise
+        except Exception as e:
+            logger.error(f"Password change error: {str(e)}")
+            raise AuthenticationError("Failed to change password")
+
+def create_secure_cookie(response, token: str, expires: datetime):
+    """Create secure cookie with appropriate flags"""
+    response.set_cookie(
+        'session',
+        token,
+        expires=expires,
+        httponly=True,
+        secure=True,
+        samesite='Strict',
+        path='/',
+        domain=None  # Set your domain here
+    )
+
+# Example usage with Flask
+from flask import Flask, request, jsonify, Response
+app = Flask(__name__)
+security = SecurityManager()
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        mfa_code = data.get('mfa_code')
+        
+        result = security.authenticate(
+            username,
+            password,
+            mfa_code,
+            request.remote_addr,
+            request.user_agent.string
+        )
+        
+        response = jsonify(result)
+        
+        if result.get('session'):
+            create_secure_cookie(
+                response,
+                result['session']['token'],
+                datetime.fromisoformat(result['session']['expires_at'])
+            )
+            
+        return response
+        
+    except AuthenticationError as e:
+        return jsonify({'error': e.message}), e.status_code
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    try:
+        token = request.cookies.get('session')
+        if token and security.logout(token):
+            response = jsonify({'success': True})
+            response.delete_cookie('session')
+            return response
+            
+        return jsonify({'error': 'Invalid session'}), 401
+        
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
