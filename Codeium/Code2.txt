@@ -1,0 +1,60 @@
+import bcrypt
+
+def hash_password(password):
+    """
+    Hash a password using bcrypt.
+
+    Args:
+        password (str): The password to hash.
+
+    Returns:
+        str: The hashed password.
+    """
+    salt = bcrypt.gensalt()
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed_password.decode('utf-8')
+
+def create_user(username, password):
+    """
+    Create a new user with a securely stored password.
+
+    Args:
+        username (str): The username of the new user.
+        password (str): The password of the new user.
+
+    Returns:
+        dict: A dictionary containing the username and hashed password.
+    """
+    hashed_password = hash_password(password)
+    return {"username": username, "password": hashed_password}
+
+def login(username, password, users):
+    """
+    Authenticate a user based on their username and password.
+
+    Args:
+        username (str): The username to authenticate.
+        password (str): The password to authenticate.
+        users (list): A list of dictionaries containing usernames and hashed passwords.
+
+    Returns:
+        bool: True if the user is authenticated, False otherwise.
+    """
+    for user in users:
+        if user["username"] == username:
+            if bcrypt.checkpw(password.encode('utf-8'), user["password"].encode('utf-8')):
+                return True
+    return False
+
+# Example usage:
+users = []
+users.append(create_user("john", "password123"))
+users.append(create_user("jane", "password456"))
+
+username = "john"
+password = "password123"
+
+if login(username, password, users):
+    print("User authenticated successfully!")
+else:
+    print("Authentication failed.")
