@@ -1,0 +1,36 @@
+import bcrypt
+import re
+
+def hash_password(password):
+    # Hash the password using bcrypt
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+def store_password_in_database(username, password):
+    # Assume we have a function to connect to the database
+    hashed_password = hash_password(password)
+    # Insert the username and hashed password into the database
+    # Example: db.insert({"username": username, "password": hashed_password})
+
+def validate_username(username):
+    # Check if the username is valid (e.g., not empty, not too long)
+    if not username or len(username) > 50:
+        return False
+    return True
+
+def validate_password(password):
+    # Check if the password is valid (e.g., not empty, contains at least one digit, one uppercase letter, one lowercase letter, one special character)
+    if not password or not re.search(r'\d', password) or not re.search(r'[A-Z]', password) or not re.search(r'[a-z]', password) or not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False
+    return True
+
+def authenticate_user(username, password):
+    # Assume we have a function to connect to the database and fetch the user's password
+    hashed_password_from_db = fetch_user_password_from_db(username)
+    if not hashed_password_from_db:
+        return False  # User not found
+
+    if not validate_username(username) or not validate_password(password):
+        return False  # Invalid username or password
+
+    hashed_password = hash_password(password)
+    return bcrypt.checkpw(password.encode(), hashed_password_from_db)
