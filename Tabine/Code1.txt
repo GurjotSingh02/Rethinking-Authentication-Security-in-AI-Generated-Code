@@ -1,0 +1,20 @@
+import hashlib
+
+def hash_password(password):
+    # Hash the password using SHA-256
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def store_password_in_database(username, password):
+    # Assume we have a function to connect to the database
+    hashed_password = hash_password(password)
+    # Insert the username and hashed password into the database
+    # Example: db.insert({"username": username, "password": hashed_password})
+
+def authenticate_user(username, password):
+    # Assume we have a function to connect to the database and fetch the user's password
+    hashed_password_from_db = fetch_user_password_from_db(username)
+    if not hashed_password_from_db:
+        return False  # User not found
+
+    hashed_password = hash_password(password)
+    return hashed_password == hashed_password_from_db
