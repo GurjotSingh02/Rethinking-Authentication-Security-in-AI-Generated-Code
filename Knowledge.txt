@@ -1,0 +1,156 @@
+mport hmac
+import hashlib
+import secrets
+from typing import Tuple
+from datetime import datetime, timedelta
+import redis
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+class AuthenticationError(Exception):
+    pass
+
+class TooManyAttemptsError(Exception):
+    pass
+
+class Authentication:
+    def __init__(self):
+        # Initialize Argon2 password hasher (memory-hard hashing algorithm)
+        self.ph = PasswordHasher(
+            time_cost=2,        # Number of iterations
+            memory_cost=65536,  # Memory usage in kibibytes
+            parallelism=4,      # Number of parallel threads
+            hash_len=32,        # Length of the hash in bytes
+            salt_len=16         # Length of the salt in bytes
+        )
+        
+        # Initialize Redis for rate limiting
+        self.redis_client = redis.Redis(
+            host='localhost',
+            port=6379,
+            db=0,
+            decode_responses=True
+        )
+
+    def _check_rate_limit(self, username: str, ip_address: str) -> None:
+        """
+        Implement rate limiting to prevent brute force attacks
+        """
+        # Check username-based attempts
+        username_key = f"auth_attempt:username:{username}"
+        ip_key = f"auth_attempt:ip:{ip_address}"
+
+        username_attempts = int(self.redis_client.get(username_key) or 0)
+        ip_attempts = int(self.redis_client.get(ip_key) or 0)
+
+        # Limit: 5 attempts per username per 15 minutes
+        # Limit: 10 attempts per IP per 15 minutes
+        if username_attempts >= 5 or ip_attempts >= 10:
+            raise TooManyAttemptsError("Too many login attempts. Please try again later.")
+
+        # Update attempt counters
+        pipe = self.redis_client.pipeline()
+        pipe.incr(username_key)
+        pipe.incr(ip_key)
+        # Set expiration for 15 minutes
+        pipe.expire(username_key, 900)
+        pipe.expire(ip_key, 900)
+        pipe.execute()
+
+    def _constant_time_compare(self, a: str, b: str) -> bool:
+        """
+        Perform constant-time comparison to prevent timing attacks
+        """
+        return hmac.compare_digest(a.encode(), b.encode())
+
+    async def authenticate_user(
+        self, 
+        username: str, 
+        password: str, 
+        ip_address: str
+    ) -> Tuple[bool, dict]:
+        """
+        Authenticate a user securely
+        
+        Args:
+            username: The username to authenticate
+            password: The password to verify
+            ip_address: IP address of the request for rate limiting
+
+        Returns:
+            Tuple[bool, dict]: Authentication result and user data if successful
+
+        Raises:
+            AuthenticationError: If authentication fails
+            TooManyAttemptsError: If too many failed attempts
+        """
+        try:
+            # Input validation
+            if not username or not password:
+                raise AuthenticationError("Username and password are required")
+
+            if len(password) < 8:
+                raise AuthenticationError("Password must be at least 8 characters")
+
+            # Check rate limiting
+            self._check_rate_limit(username, ip_address)
+
+            # Fetch user from database (pseudo-code)
+            user = await self.get_user_from_db(username)
+            if not user:
+                # Use constant time comparison even for non-existent users
+                # to prevent username enumeration
+                self.ph.verify(
+                    self.ph.hash(secrets.token_urlsafe(32)),
+                    password
+                )
+                raise AuthenticationError("Invalid username or password")
+
+            # Verify password using Argon2
+            try:
+                self.ph.verify(user['password_hash'], password)
+            except VerifyMismatchError:
+                raise AuthenticationError("Invalid username or password")
+
+            # Check if hash needs rehashing (e.g., if parameters changed)
+                new_hash = self.ph.hash(password)
+                await self.update_password_hash(username, new_hash)
+
+            # Reset failed attempt counters on successful login
+            self.redis_client.delete(f"auth_attempt:username:{username}")
+            self.redis_client.delete(f"auth_attempt:ip:{ip_address}")
+
+            # Return user data (exclude sensitive information)
+            user_data = {
+                'id': user['id'],
+                'username': user['username'],
+                'email': user['email'],
+                'last_login': datetime.utcnow()
+            }
+
+            return True, user_data
+
+        except (AuthenticationError, TooManyAttemptsError) as e:
+            raise e
+        except Exception as e:
+            # Log the error securely (don't expose internal errors to user)
+            await self.log_error(str(e))
+            raise AuthenticationError("Authentication failed")
+
+    async def get_user_from_db(self, username: str) -> dict:
+        """
+        Fetch user from database (implement according to your database)
+        """
+        pass
+
+    async def update_password_hash(self, username: str, new_hash: str) -> None:
+        """
+        Update password hash in database (implement according to your database)
+        """
+        pass
+
+    async def log_error(self, error_message: str) -> None:
+        """
+        Implement secure error logging
+        """
+        pass
