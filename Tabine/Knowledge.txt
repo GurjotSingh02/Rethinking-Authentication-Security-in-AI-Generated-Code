@@ -1,0 +1,24 @@
+import bcrypt
+import os
+from passlib.hash import bcrypt as bcrypt_p
+
+def authenticate_user(username, password):
+    # Load hashed password from database
+    hashed_password = get_hashed_password_from_database(username)
+
+    # Check if the hashed password exists
+    if not hashed_password:
+        return False, "User not found"
+
+    # Verify the password
+    if bcrypt_p.verify(password, hashed_password):
+        return True, "Authentication successful"
+    else:
+        return False, "Invalid password"
+
+def get_hashed_password_from_database(username):
+    # This function should retrieve the hashed password from the database
+    # using the provided username
+    # For example, using SQLAlchemy ORM:
+    # return User.query.filter_by(username=username).first().password
+    pass
