@@ -1,0 +1,314 @@
+from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import bcrypt
+import pyotp
+import jwt
+from datetime import datetime, timedelta
+import secrets
+from typing import Tuple, Optional, Dict
+import logging
+import re
+from dataclasses import dataclass
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+Base = declarative_base()
+
+@dataclass
+class LoginResult:
+    success: bool
+    message: str
+    requires_2fa: bool = False
+    session_token: Optional[str] = None
+    user_id: Optional[str] = None
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(String(36), primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    mfa_secret = Column(String(32), nullable=True)
+    mfa_enabled = Column(Boolean, default=False)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    last_login = Column(DateTime, nullable=True)
+    password_changed_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+class Session(Base):
+    __tablename__ = 'sessions'
+    
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    token = Column(String(255), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(String(255), nullable=True)
+
+class SecurityManager:
+    def __init__(self):
+        # Initialize database connection
+        db_url = os.getenv('DATABASE_URL')
+        jwt_secret = os.getenv('JWT_SECRET_KEY')
+        if not jwt_secret:
+            raise ValueError("JWT secret key not configured")
+            
+        self.engine = create_engine(db_url)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        
+        # Security configuration
+        self.JWT_SECRET = jwt_secret
+        self.JWT_EXPIRY = timedelta(hours=1)
+        self.MAX_LOGIN_ATTEMPTS = 5
+        self.LOCKOUT_DURATION = timedelta(minutes=15)
+        self.PASSWORD_EXPIRY = timedelta(days=90)
+        self.MIN_PASSWORD_LENGTH = 12
+
+    def generate_mfa_secret(self) -> str:
+        """Generate a new MFA secret key"""
+        return pyotp.random_base32()
+
+    def verify_mfa_code(self, secret: str, code: str) -> bool:
+        """Verify MFA code"""
+        totp = pyotp.TOTP(secret)
+        return totp.verify(code)
+
+    def create_session_token(self, user_id: str, ip_address: str, 
+                           user_agent: str) -> Tuple[str, datetime]:
+        """Create a new session token"""
+        session_id = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + self.JWT_EXPIRY
+        
+        payload = {
+            'user_id': user_id,
+            'session_id': session_id,
+            'exp': expires_at.timestamp()
+        }
+        
+        token = jwt.encode(payload, self.JWT_SECRET, algorithm='HS256')
+        
+        session = Session(
+            id=session_id,
+            user_id=user_id,
+            token=token,
+            expires_at=expires_at,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        
+        db_session = self.Session()
+        try:
+            db_session.add(session)
+            db_session.commit()
+            return token, expires_at
+        finally:
+            db_session.close()
+
+    def validate_password(self, password: str) -> Tuple[bool, str]:
+        """Validate password strength"""
+        if len(password) < self.MIN_PASSWORD_LENGTH:
+            return False, f"Password must be at least {self.MIN_PASSWORD_LENGTH} characters"
+            
+        checks = [
+            (r"[A-Z]", "uppercase letter"),
+            (r"[a-z]", "lowercase letter"),
+            (r"\d", "number"),
+            (r"[!@#$%^&*(),.?\":{}|<>]", "special character")
+        ]
+        
+        for pattern, requirement in checks:
+            if not re.search(pattern, password):
+                return False, f"Password must contain at least one {requirement}"
+                
+        return True, "Password meets requirements"
+
+    def login_initial(self, username: str, password: str, 
+                     ip_address: str) -> LoginResult:
+        """First step of login process - validate credentials"""
+        session = self.Session()
+        try:
+            # Input validation
+            if not username or not password:
+                return LoginResult(False, "Username and password required")
+                
+            user = session.query(User).filter_by(username=username).first()
+            
+            if not user:
+                logger.warning(f"Login attempt for non-existent user: {username}")
+                return LoginResult(False, "Invalid credentials")
+
+            # Check account lockout
+            if user.locked_until and user.locked_until > datetime.utcnow():
+                return LoginResult(False, 
+                    f"Account is locked. Try again in {remaining_time} minutes")
+
+            # Verify password
+            if not bcrypt.checkpw(password.encode('utf-8'), 
+                                user.password_hash.encode('utf-8')):
+                user.failed_attempts += 1
+                
+                if user.failed_attempts >= self.MAX_LOGIN_ATTEMPTS:
+                    user.locked_until = datetime.utcnow() + self.LOCKOUT_DURATION
+                    session.commit()
+                    logger.warning(f"Account locked: {username}")
+                    return LoginResult(False, "Account locked due to too many failed attempts")
+                
+                session.commit()
+                remaining = self.MAX_LOGIN_ATTEMPTS - user.failed_attempts
+                return LoginResult(False, f"Invalid credentials. {remaining} attempts remaining")
+
+            # Check password expiration
+            if (user.password_changed_at and 
+                datetime.utcnow() - user.password_changed_at > self.PASSWORD_EXPIRY):
+                return LoginResult(False, "Password expired. Please reset your password")
+
+            # Reset failed attempts on successful password verification
+            user.failed_attempts = 0
+            session.commit()
+
+            # If MFA is enabled, require second factor
+            if user.mfa_enabled:
+                return LoginResult(True, "2FA code required", requires_2fa=True, 
+                                user_id=user.id)
+
+            # If no MFA, complete login
+            token, _ = self.create_session_token(user.id, ip_address, user_agent)
+            return LoginResult(True, "Login successful", session_token=token)
+
+        except Exception as e:
+            logger.error(f"Login error: {str(e)}")
+            return LoginResult(False, "An error occurred during login")
+        finally:
+            session.close()
+
+    def verify_2fa(self, user_id: str, code: str, ip_address: str, 
+                   user_agent: str) -> LoginResult:
+        """Second step of login process - verify 2FA code"""
+        session = self.Session()
+        try:
+            user = session.query(User).filter_by(id=user_id).first()
+            
+            if not user or not user.mfa_secret:
+                return LoginResult(False, "Invalid user or MFA not configured")
+
+            if not self.verify_mfa_code(user.mfa_secret, code):
+                return LoginResult(False, "Invalid 2FA code")
+
+            # Create session token after successful 2FA
+            token, _ = self.create_session_token(user.id, ip_address, user_agent)
+            
+            # Update last login timestamp
+            user.last_login = datetime.utcnow()
+            session.commit()
+
+            return LoginResult(True, "Login successful", session_token=token)
+
+        except Exception as e:
+            logger.error(f"2FA verification error: {str(e)}")
+            return LoginResult(False, "An error occurred during 2FA verification")
+        finally:
+            session.close()
+
+    def setup_2fa(self, user_id: str) -> Tuple[bool, str, Optional[str]]:
+        """Set up 2FA for a user"""
+        session = self.Session()
+        try:
+            user = session.query(User).filter_by(id=user_id).first()
+            
+            if not user:
+                return False, "User not found", None
+
+            # Generate new MFA secret
+            mfa_secret = self.generate_mfa_secret()
+            user.mfa_secret = mfa_secret
+            user.mfa_enabled = True
+            
+            session.commit()
+            
+            # Generate QR code provisioning URI
+            totp = pyotp.TOTP(mfa_secret)
+            provisioning_uri = totp.provisioning_uri(
+                user.email,
+                issuer_name="YourApp"
+            )
+            
+            return True, "2FA enabled successfully", provisioning_uri
+
+        except Exception as e:
+            session.rollback()
+            logger.error(f"2FA setup error: {str(e)}")
+            return False, "Error setting up 2FA", None
+        finally:
+            session.close()
+
+    def validate_session(self, token: str, ip_address: str) -> Tuple[bool, Optional[str]]:
+        """Validate session token"""
+        try:
+            # Decode JWT token
+            payload = jwt.decode(token, self.JWT_SECRET, algorithms=['HS256'])
+            session_id = payload.get('session_id')
+            user_id = payload.get('user_id')
+
+            session = self.Session()
+            db_session = session.query(Session).filter_by(
+                id=session_id,
+                user_id=user_id
+            ).first()
+
+            if not db_session:
+                return False, None
+
+            # Validate session expiry
+            if datetime.utcnow() > db_session.expires_at:
+                return False, None
+
+            # Optional: Validate IP address hasn't changed
+            if db_session.ip_address != ip_address:
+                logger.warning(f"IP address mismatch for session {session_id}")
+                return False, None
+
+            return True, user_id
+
+        except jwt.ExpiredSignatureError:
+            return False, None
+        except jwt.InvalidTokenError:
+            return False, None
+        finally:
+            session.close()
+
+# Example usage
+def handle_login_request(username: str, password: str, mfa_code: Optional[str], 
+                        ip_address: str, user_agent: str) -> Dict:
+    security = SecurityManager()
+    
+    # First step - validate credentials
+    result = security.login_initial(username, password, ip_address)
+    
+    if not result.success:
+        return {"success": False, "message": result.message}
+        
+    # If 2FA is required
+    if result.requires_2fa:
+        if not mfa_code:
+
+            
+        # Verify 2FA code
+        result = security.verify_2fa(result.user_id, mfa_code, 
+                                   ip_address, user_agent)
+        
+    if result.success:
+        return {
+            "success": True,
+            "message": "Login successful",
+            "session_token": result.session_token
+        }
+        
+    return {"success": False, "message": result.message}
