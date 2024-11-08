@@ -1,0 +1,173 @@
+from sqlalchemy import create_engine, Column, String, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import bcrypt
+from datetime import datetime
+import boto3
+import os
+from typing import Optional, Tuple
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database setup
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    username = Column(String(50), primary_key=True)
+    password_hash = Column(String(255), nullable=False)
+    last_login = Column(DateTime)
+    
+def get_db_connection():
+    """Get database connection string from AWS Secrets Manager"""
+    try:
+        session = boto3.session.Session()
+        secrets_client = session.client('secretsmanager')
+        
+        # Fetch database credentials from Secrets Manager
+        secret_name = os.environ.get('DB_SECRETS_NAME')
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        return response['SecretString']
+    except Exception as e:
+        logger.error(f"Error fetching database credentials: {str(e)}")
+        raise
+
+def init_db():
+    """Initialize database connection and create tables"""
+    try:
+        connection_string = get_db_connection()
+        engine = create_engine(connection_string)
+        Base.metadata.create_all(engine)
+        return sessionmaker(bind=engine)
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        raise
+
+class UserAuth:
+    def __init__(self):
+        self.Session = init_db()
+        self.max_login_attempts = 5
+        self.login_attempts = {}
+
+    def create_user(self, username: str, password: str) -> Tuple[bool, str]:
+        """
+        Create a new user with a securely hashed password
+        """
+        try:
+            session = self.Session()
+            
+            # Check if user already exists
+            if session.query(User).filter_by(username=username).first():
+                return False, "Username already exists"
+            
+            # Validate password strength
+            if not self._is_password_strong(password):
+                return False, "Password does not meet security requirements"
+            
+            # Hash password
+            salt = bcrypt.gensalt()
+            password_hash = bcrypt.hashpw(password.encode('utf-8'), salt)
+            
+            # Create new user
+            
+            session.add(new_user)
+            session.commit()
+            logger.info(f"User created successfully: {username}")
+            return True, "User created successfully"
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error creating user: {str(e)}")
+            return False, "Error creating user"
+        finally:
+            session.close()
+
+    def login(self, username: str, password: str) -> Tuple[bool, str]:
+        """
+        Authenticate user login
+        """
+        try:
+            # Check for too many login attempts
+            if self._is_account_locked(username):
+                return False, "Account temporarily locked due to too many failed attempts"
+
+            session = self.Session()
+            user = session.query(User).filter_by(username=username).first()
+            
+            if not user:
+                self._record_failed_attempt(username)
+                return False, "Invalid credentials"
+            
+            # Verify password
+            if bcrypt.checkpw(password.encode('utf-8'), 
+                            user.password_hash.encode('utf-8')):
+                # Update last login time
+                user.last_login = datetime.utcnow()
+                session.commit()
+                
+                # Reset login attempts on successful login
+                if username in self.login_attempts:
+                    del self.login_attempts[username]
+                    
+                logger.info(f"Successful login: {username}")
+                return True, "Login successful"
+            
+            self._record_failed_attempt(username)
+            return False, "Invalid credentials"
+            
+        except Exception as e:
+            logger.error(f"Login error: {str(e)}")
+            return False, "Login error occurred"
+        finally:
+            session.close()
+
+    def _is_password_strong(self, password: str) -> bool:
+        """
+        Check if password meets security requirements
+        """
+        if len(password) < 8:
+            return False
+        if not any(c.isupper() for c in password):
+            return False
+        if not any(c.islower() for c in password):
+            return False
+        if not any(c.isdigit() for c in password):
+            return False
+        if not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
+            return False
+        return True
+
+    def _record_failed_attempt(self, username: str):
+        """
+        Record failed login attempt
+        """
+        if username not in self.login_attempts:
+            self.login_attempts[username] = 1
+        else:
+            self.login_attempts[username] += 1
+        logger.warning(f"Failed login attempt for user: {username}")
+
+    def _is_account_locked(self, username: str) -> bool:
+        """
+        Check if account is locked due to too many failed attempts
+        """
+        return self.login_attempts.get(username, 0) >= self.max_login_attempts
+
+# Example usage
+def main():
+    auth = UserAuth()
+    
+    # Create a new user
+    success, message = auth.create_user("john_doe", "SecurePass123!")
+    print(f"User creation: {message}")
+    
+    # Attempt login
+    success, message = auth.login("john_doe", "SecurePass123!")
+    print(f"Login attempt: {message}")
+
+if __name__ == "__main__":
+    main()
