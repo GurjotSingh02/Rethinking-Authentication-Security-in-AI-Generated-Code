@@ -1,0 +1,229 @@
+from sqlalchemy import create_engine, Column, String, DateTime, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+import bcrypt
+from datetime import datetime, timedelta
+import re
+from typing import Tuple, Optional
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database setup
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(String(36), primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login = Column(DateTime)
+    is_active = Column(Boolean, default=True)
+    failed_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime)
+
+class UserAuthenticator:
+    def __init__(self):
+        # Initialize database connection
+        db_url = os.getenv('DATABASE_URL')
+        self.engine = create_engine(db_url)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        
+        # Configuration
+        self.MIN_PASSWORD_LENGTH = 8
+        self.MAX_LOGIN_ATTEMPTS = 5
+        self.LOCKOUT_DURATION = timedelta(minutes=15)
+
+    def validate_password_strength(self, password: str) -> Tuple[bool, str]:
+        """
+        Validate password strength requirements
+        """
+        if len(password) < self.MIN_PASSWORD_LENGTH:
+            return False, f"Password must be at least {self.MIN_PASSWORD_LENGTH} characters long"
+        
+        if not re.search(r"[A-Z]", password):
+            return False, "Password must contain at least one uppercase letter"
+            
+        if not re.search(r"[a-z]", password):
+            return False, "Password must contain at least one lowercase letter"
+            
+        if not re.search(r"\d", password):
+            return False, "Password must contain at least one number"
+            
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return False, "Password must contain at least one special character"
+            
+        return True, "Password meets requirements"
+
+    def validate_username(self, username: str) -> Tuple[bool, str]:
+        """
+        Validate username format
+        """
+        if not username or len(username) < 3:
+            return False, "Username must be at least 3 characters long"
+            
+        if not re.match(r"^[a-zA-Z0-9_-]+$", username):
+            return False, "Username can only contain letters, numbers, underscores, and hyphens"
+            
+        return True, "Username is valid"
+
+    def create_user(self, username: str, password: str, email: str) -> Tuple[bool, str]:
+        """
+        Create a new user with validated input and hashed password
+        """
+        try:
+            # Validate input
+            username_valid, username_msg = self.validate_username(username)
+            if not username_valid:
+                return False, username_msg
+                
+            password_valid, password_msg = self.validate_password_strength(password)
+            if not password_valid:
+                return False, password_msg
+                
+            if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email):
+                return False, "Invalid email format"
+
+            session = self.Session()
+            
+            # Check if username or email already exists
+            if session.query(User).filter(
+                (User.username == username) | (User.email == email)
+            ).first():
+                return False, "Username or email already exists"
+
+            # Hash password
+            salt = bcrypt.gensalt()
+            password_hash = bcrypt.hashpw(password.encode('utf-8'), salt)
+
+            # Create new user
+            
+            session.add(new_user)
+            session.commit()
+            logger.info(f"User created successfully: {username}")
+            return True, "User created successfully"
+            
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"Database error creating user: {str(e)}")
+            return False, "Error creating user"
+        except Exception as e:
+            logger.error(f"Unexpected error creating user: {str(e)}")
+            return False, "Unexpected error occurred"
+        finally:
+            session.close()
+
+    def login(self, username: str, password: str) -> Tuple[bool, str, Optional[User]]:
+        """
+        Authenticate user login with security measures
+        """
+        try:
+            session = self.Session()
+            user = session.query(User).filter_by(username=username).first()
+
+            if not user:
+                logger.warning(f"Login attempt for non-existent user: {username}")
+                return False, "Invalid credentials", None
+
+            # Check if account is locked
+            if user.locked_until and user.locked_until > datetime.utcnow():
+                return False, f"Account is locked. Try again in {remaining_time} minutes", None
+
+            # Verify password
+            if bcrypt.checkpw(password.encode('utf-8'), 
+                            user.password_hash.encode('utf-8')):
+                # Reset failed attempts on successful login
+                user.failed_attempts = 0
+                user.last_login = datetime.utcnow()
+                user.locked_until = None
+                session.commit()
+                
+                logger.info(f"Successful login: {username}")
+                return True, "Login successful", user
+            else:
+                # Increment failed attempts
+                user.failed_attempts += 1
+                
+                # Lock account if too many failed attempts
+                if user.failed_attempts >= self.MAX_LOGIN_ATTEMPTS:
+                    user.locked_until = datetime.utcnow() + self.LOCKOUT_DURATION
+                    logger.warning(f"Account locked due to too many failed attempts: {username}")
+                    message = "Account locked due to too many failed attempts"
+                else:
+                    remaining_attempts = self.MAX_LOGIN_ATTEMPTS - user.failed_attempts
+                    message = f"Invalid credentials. {remaining_attempts} attempts remaining"
+                
+                session.commit()
+                return False, message, None
+
+        except SQLAlchemyError as e:
+            logger.error(f"Database error during login: {str(e)}")
+            return False, "Error during login", None
+        except Exception as e:
+            logger.error(f"Unexpected error during login: {str(e)}")
+            return False, "Unexpected error occurred", None
+        finally:
+            session.close()
+
+        """
+        Change user password with validation
+        """
+        try:
+            session = self.Session()
+            user = session.query(User).filter_by(id=user_id).first()
+
+            if not user:
+                return False, "User not found"
+
+            # Verify old password
+            if not bcrypt.checkpw(old_password.encode('utf-8'), 
+                                user.password_hash.encode('utf-8')):
+                return False, "Current password is incorrect"
+
+            # Validate new password
+            password_valid, password_msg = self.validate_password_strength(new_password)
+            if not password_valid:
+                return False, password_msg
+
+            # Hash and save new password
+            salt = bcrypt.gensalt()
+            new_password_hash = bcrypt.hashpw(new_password.encode('utf-8'), salt)
+            user.password_hash = new_password_hash.decode('utf-8')
+            
+            session.commit()
+            logger.info(f"Password changed successfully for user: {user.username}")
+            return True, "Password changed successfully"
+
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error changing password: {str(e)}")
+            return False, "Error changing password"
+        finally:
+            session.close()
+
+# Example usage
+def main():
+    auth = UserAuthenticator()
+    
+    # Create user
+    success, message = auth.create_user(
+        "john_doe",
+        "SecurePass123!",
+        "john@example.com"
+    )
+    print(f"User creation: {message}")
+    
+    # Login attempt
+    success, message, user = auth.login("john_doe", "SecurePass123!")
+    print(f"Login attempt: {message}")
+
+if __name__ == "__main__":
+    main()
