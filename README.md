@@ -1,4 +1,4 @@
-Rethinking Authentication Security in AI-Generated Code
+###Rethinking Authentication Security in AI-Generated Code
 
 Authors: Gurjot Singh, Prach Chantasantitam
 Institution: University of Waterloo, Ontario, Canada
@@ -23,39 +23,46 @@ GitHub Copilot
 Codeium
 CodeWhisperer
 ChatGPT
+
 2. Prompt Engineering
 Developed basic and advanced prompts to analyze AI's intrinsic security awareness:
 
 Basic prompts focus on general functionality.
 Advanced prompts emphasize "secure" code and adherence to "NIST Guidelines."
+
 3. Compliance Testing with RAG
 Automated the assessment of NIST SP 800-63B adherence using:
 
 NotebookLM for guideline parsing.
 ChatGPT-4 for evaluation and reporting.
+
 4. Penetration Testing
 Used OWASP ZAP to identify vulnerabilities in generated code, including:
 
 SQL Injection
 Cross-Site Scripting (XSS)
 Token Hijacking
+
 5. Comparative Analysis
 Compared outputs to identify strengths and weaknesses, providing actionable recommendations.
 
 📊 Results
 
-Highlights
-ChatGPT showed the most improvement in generating secure code when using advanced prompts.
-Common Vulnerabilities Identified:
-Insecure password management.
-Weak MFA implementations using non-cryptographic randomness.
-Lack of rate limiting, allowing brute-force attacks.
-MFA Code Delivery Methods
-Tool	Delivery Medium
-GitHub Copilot	SMS (Twilio)
-CodeWhisperer	SMS (Twilio)
-Codeium	TOTP (PyOTP)
-ChatGPT	Email (SMTP)
+### **Common Vulnerabilities Identified**
+- Insecure password management.
+- Weak MFA implementations using non-cryptographic randomness.
+- Lack of rate limiting, allowing brute-force attacks.
+
+### **MFA Code Delivery Methods**
+
+| **Tool**           | **Delivery Medium** |
+|---------------------|---------------------|
+| GitHub Copilot      | SMS (Twilio)       |
+| CodeWhisperer       | SMS (Twilio)       |
+| Codeium             | TOTP (PyOTP)       |
+| ChatGPT             | Email (SMTP)       |
+
+
 🔬 Key Findings
 
 Insecure Defaults: Tools rely heavily on default configurations, often not secure.
@@ -63,28 +70,27 @@ Cryptographic Choices: ChatGPT demonstrated the best practices by using Argon2, 
 RAG Effectiveness: RAG effectively identifies guideline violations but struggles with nuanced security concepts like encryption vs. hashing.
 🧑‍💻 How to Use This Repository
 
-Prerequisites
-Python 3.9+
-Flask, OWASP ZAP, and NotebookLM installed.
-Getting Started
-Clone the repository:
-git clone https://github.com/<your-username>/rethinking-authentication-security.git
-cd rethinking-authentication-security
-Install dependencies:
-pip install -r requirements.txt
-Run the application:
-python app.py
+## 🧑‍💻 Getting Started
+
+### **Prerequisites**
+- Python 3.9+
+- Flask, OWASP ZAP, and NotebookLM installed.
+
+### **Setup Instructions**
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/<your-username>/rethinking-authentication-security.git
+   cd rethinking-authentication-security
+   
+Then use the codes provided under each section.
+
 📚 References
 
-NIST SP 800-63B Guidelines: NIST Guidelines
-OWASP Cheat Sheets: Authentication Cheat Sheet
+NIST SP 800-63B Guidelines: NIST Guidelines (Mentioned in the PDF)
+OWASP Cheat Sheets: Authentication Cheat Sheet (Mentioned in the PDF)
+
 🎯 Future Work
 
 Extend RAG compliance checks for nuanced vulnerabilities.
 Incorporate fine-tuned security-specific AI models.
 Optimize MFA code generation with secure randomness and validation mechanisms.
-📩 Contact
-
-For questions or collaborations, please contact:
-Gurjot Singh - gurjot.singh1@uwaterloo.ca
-Prach Chantasantitam - pchantas@uwaterloo.ca
