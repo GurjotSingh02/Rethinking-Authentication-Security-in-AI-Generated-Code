@@ -1,4 +1,4 @@
-###Rethinking Authentication Security in AI-Generated Code
+### **Rethinking Authentication Security in AI-Generated Code**
 
 Authors: Gurjot Singh, Prach Chantasantitam
 Institution: University of Waterloo, Ontario, Canada
